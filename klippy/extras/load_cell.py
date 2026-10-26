@@ -8,6 +8,7 @@ from . import hx71x
 from . import ads1220
 from . import cs1237
 from . import ads131m0x
+from . import bulk_sensor
 from .bulk_sensor import BatchWebhooksClient
 import collections, itertools
 # We want either Python 3's zip() or Python 2's izip() but NOT 2's zip():
@@ -372,6 +373,7 @@ class LoadCellSampleCollector:
 
 # Printer class that controls the load cell
 MIN_COUNTS_PER_GRAM = 1.
+UPDATE_INTERVAL = 0.10
 class LoadCell:
     def __init__(self, config, sensor):
         self.printer = printer = config.get_printer()
@@ -388,16 +390,18 @@ class LoadCell:
         self.invert = config.getchoice('sensor_orientation',
                         {'normal': 1., 'inverted': -1.}, default="normal")
         LoadCellCommandHelper(config, self)
-        # Client support:
-        self.clients = ApiClientHelper(printer)
+        # Client support. This replaces the sensor's own BatchBulkHelper, so
+        # the sensor's batch, start and finish helpers are called directly.
+        self.batch_bulk = bulk_sensor.BatchBulkHelper(
+            printer, self._process_batch, self.sensor._start_measurements,
+            self.sensor._finish_measurements, UPDATE_INTERVAL)
         header = {"header": ["time", "force (g)", "counts", "tare_counts"]}
-        self.clients.add_mux_endpoint("load_cell/dump_force",
-                                      "load_cell", self.name, header)
+        self.batch_bulk.add_mux_endpoint("load_cell/dump_force",
+                                         "load_cell", self.name, header)
         # startup, when klippy is ready, start capturing data
         printer.register_event_handler("klippy:ready", self._handle_ready)
 
     def _handle_do_ready(self, eventtime):
-        self.sensor.add_client(self._sensor_data_event)
         self.add_client(self._track_force)
         # announce calibration status on ready
         if self.is_calibrated():
@@ -407,25 +411,19 @@ class LoadCell:
     def _handle_ready(self):
         self.printer.get_reactor().register_callback(self._handle_do_ready)
 
-    # convert raw counts to grams and broadcast to clients
-    def _sensor_data_event(self, msg):
-        data = msg.get("data")
-        errors = msg.get("errors")
-        overflows = msg.get("overflows")
-        if data is None:
-            return None
-        samples = []
-        for row in data:
+    # convert raw counts to grams in place
+    def _process_batch(self, eventtime):
+        msg = self.sensor._process_batch(eventtime)
+        samples = msg['data']
+        tare_counts = self.tare_counts
+        for i, s in enumerate(samples):
             # [time, grams, counts, tare_counts]
-            samples.append([row[0], self.counts_to_grams(row[1]), row[1],
-                            self.tare_counts])
-        msg = {'data': samples, 'errors': errors, 'overflows': overflows}
-        self.clients.send(msg)
-        return True
+            samples[i] = (s[0], self.counts_to_grams(s[1]), s[1], tare_counts)
+        return msg
 
     # get internal events of force data
     def add_client(self, callback):
-        self.clients.add_client(callback)
+        self.batch_bulk.add_client(callback)
 
     def tare(self, tare_counts):
         self.tare_counts = int(tare_counts)
