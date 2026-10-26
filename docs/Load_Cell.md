@@ -106,6 +106,10 @@ object in a macro:
 This provides an average force over the last 1 second, similar to how
 temperature sensors work.
 
+If these values are not needed, `LOAD_CELL_TRACK_FORCE ENABLE=0` stops the
+continuous reading. The load cell is then only read while it is needed (probing,
+the `LOAD_CELL_*` commands, API clients), which reduces the load on the MCU.
+
 ## Taring a Load Cell
 Taring, sometimes called zeroing, sets the current weight reported by the
 load_cell to 0. This is useful for measuring relative to a known weight. e.g.

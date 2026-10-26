@@ -624,8 +624,9 @@ class TapSession:
 
 
 class LoadCellProbeCommands:
-    def __init__(self, config, load_cell_probing_move):
+    def __init__(self, config, load_cell_inst, load_cell_probing_move):
         self._printer = config.get_printer()
+        self._load_cell = load_cell_inst
         self._load_cell_probing_move = load_cell_probing_move
         self._register_commands()
 
@@ -642,17 +643,24 @@ class LoadCellProbeCommands:
         timeout = gcmd.get_float("TIMEOUT", 30., minval=1., maxval=120.)
         gcmd.respond_info("Tap the load cell %s times:" % (taps,))
         reactor = self._printer.get_reactor()
-        for i in range(0, taps):
-            collector = self._load_cell_probing_move.start_collector()
-            self._load_cell_probing_move.pause_and_tare(gcmd, collector)
-            collector.finish()
-            result = self._load_cell_probing_move.probing_test(gcmd, timeout)
-            if result == 0.:
-                # notify of error, likely due to timeout
-                raise gcmd.error("Test timeout out")
-            gcmd.respond_info("Tap Detected!")
-            # give the user some time for their finger to move away
-            reactor.pause(reactor.monotonic() + 0.2)
+        # keep the sensor running for the whole test
+        is_testing = [True]
+        self._load_cell.add_client(lambda msg: is_testing[0])
+        try:
+            for i in range(0, taps):
+                collector = self._load_cell_probing_move.start_collector()
+                self._load_cell_probing_move.pause_and_tare(gcmd, collector)
+                collector.finish()
+                result = self._load_cell_probing_move.probing_test(gcmd,
+                                                                   timeout)
+                if result == 0.:
+                    # notify of error, likely due to timeout
+                    raise gcmd.error("Test timeout out")
+                gcmd.respond_info("Tap Detected!")
+                # give the user some time for their finger to move away
+                reactor.pause(reactor.monotonic() + 0.2)
+        finally:
+            is_testing[0] = False
         gcmd.respond_info("Test complete, %s taps detected" % (taps,))
 
 
@@ -709,7 +717,7 @@ class LoadCellPrinterProbe:
             self._param_helper, tap_session.start_probe_session,
             nozzle_probe=True)
         # printer integration
-        LoadCellProbeCommands(config, load_cell_probing_move)
+        LoadCellProbeCommands(config, self._load_cell, load_cell_probing_move)
         probe.HomingViaProbeHelper(config, self.get_offsets()[2])
         self._printer.add_object('probe', self)
 
