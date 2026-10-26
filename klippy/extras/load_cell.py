@@ -82,6 +82,9 @@ class LoadCellCommandHelper:
         gcode.register_mux_command("LOAD_CELL_DIAGNOSTIC", "LOAD_CELL", name,
                                    self.cmd_LOAD_CELL_DIAGNOSTIC,
                                    desc=self.cmd_LOAD_CELL_DIAGNOSTIC_help)
+        gcode.register_mux_command("LOAD_CELL_TRACK_FORCE", "LOAD_CELL", name,
+                                   self.cmd_LOAD_CELL_TRACK_FORCE,
+                                   desc=self.cmd_LOAD_CELL_TRACK_FORCE_help)
 
     cmd_LOAD_CELL_TARE_help = "Set the Zero point of the load cell"
     def cmd_LOAD_CELL_TARE(self, gcmd):
@@ -106,6 +109,13 @@ class LoadCellCommandHelper:
             gcmd.respond_info("---.-g (%.2f%%)" % (percent,))
         else:
             gcmd.respond_info("%.1fg (%.2f%%)" % (force, percent))
+
+    cmd_LOAD_CELL_TRACK_FORCE_help = "Turn continuous load cell reading on or off"
+    def cmd_LOAD_CELL_TRACK_FORCE(self, gcmd):
+        enable = gcmd.get_int("ENABLE", 1, minval=0, maxval=1)
+        self.load_cell.set_track_force(enable)
+        gcmd.respond_info("Load cell force tracking %s"
+                          % ("enabled" if enable else "disabled",))
 
     cmd_LOAD_CELL_DIAGNOSTIC_help = "Check the health of the load cell"
     def cmd_LOAD_CELL_DIAGNOSTIC(self, gcmd):
@@ -394,15 +404,17 @@ class LoadCell:
         # the sensor's batch, start and finish helpers are called directly.
         self.batch_bulk = bulk_sensor.BatchBulkHelper(
             printer, self._process_batch, self.sensor._start_measurements,
-            self.sensor._finish_measurements, UPDATE_INTERVAL)
+            self._finish_measurements, UPDATE_INTERVAL)
         header = {"header": ["time", "force (g)", "counts", "tare_counts"]}
         self.batch_bulk.add_mux_endpoint("load_cell/dump_force",
                                          "load_cell", self.name, header)
-        # startup, when klippy is ready, start capturing data
+        self._is_tracking = False
+        self._is_track_subscribed = False
         printer.register_event_handler("klippy:ready", self._handle_ready)
 
     def _handle_do_ready(self, eventtime):
-        self.add_client(self._track_force)
+        # read the sensor continuously unless LOAD_CELL_TRACK_FORCE turns it off
+        self.set_track_force(True)
         # announce calibration status on ready
         if self.is_calibrated():
             self.printer.send_event("load_cell:calibrate", self)
@@ -410,6 +422,11 @@ class LoadCell:
             self.printer.send_event("load_cell:tare", self)
     def _handle_ready(self):
         self.printer.get_reactor().register_callback(self._handle_do_ready)
+
+    def _finish_measurements(self):
+        self.sensor._finish_measurements()
+        # force values are only reported while the sensor runs
+        self._force_buffer.clear()
 
     # convert raw counts to grams in place
     def _process_batch(self, eventtime):
@@ -419,6 +436,7 @@ class LoadCell:
         for i, s in enumerate(samples):
             # [time, grams, counts, tare_counts]
             samples[i] = (s[0], self.counts_to_grams(s[1]), s[1], tare_counts)
+        self._track_force(samples)
         return msg
 
     # get internal events of force data
@@ -479,15 +497,24 @@ class LoadCell:
                     "Some samples are saturated (+/-100%)")
         return avg(select_column(samples, 2))
 
-    # Provide ongoing force tracking/averaging for status updates
-    def _track_force(self, msg):
+    # Provide force tracking/averaging for status updates
+    def _track_force(self, samples):
         if not (self.is_calibrated() and self.is_tared()):
-            return True
-        samples = msg['data']
+            return
         # selectColumn unusable here because Python 2 lacks deque.extend
         for sample in samples:
             self._force_buffer.append(sample[1])
-        return True
+
+    # keep the sensor running so force_g stays updated
+    def _track_force_cb(self, msg):
+        self._is_track_subscribed = self._is_tracking
+        return self._is_tracking
+
+    def set_track_force(self, enable):
+        self._is_tracking = bool(enable)
+        if self._is_tracking and not self._is_track_subscribed:
+            self._is_track_subscribed = True
+            self.add_client(self._track_force_cb)
 
     def _force_g(self):
         if (self.is_calibrated() and self.is_tared()
